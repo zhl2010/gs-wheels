@@ -1,0 +1,74 @@
+name: Build 3DGS CUDA wheels
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install MSVC 14.29 toolset (officially supported by CUDA 11.8)
+        shell: pwsh
+        run: |
+          $setup = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\setup.exe"
+          & $setup modify --installPath "C:\Program Files\Microsoft Visual Studio\2022\Enterprise" --quiet --norestart --nocache --add Microsoft.VisualStudio.Component.VC.14.29.17.11
+          Write-Host "VS modify exit=$LASTEXITCODE (0 or 3010 are OK)"
+          Get-ChildItem "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Tools\MSVC" | Select-Object -ExpandProperty Name
+
+      - name: Install CUDA 11.8
+        uses: Jimver/cuda-toolkit@v0.2.22
+        with:
+          cuda: '11.8.0'
+
+      - name: Install PyTorch cu118
+        shell: pwsh
+        run: |
+          pip install --upgrade pip wheel
+          pip install torch==2.1.2 torchvision==0.16.2 --index-url https://download.pytorch.org/whl/cu118
+
+      - name: Build wheels
+        shell: pwsh
+        env:
+          TORCH_CUDA_ARCH_LIST: '5.0'
+          DISTUTILS_USE_SDK: '1'
+        run: |
+          $ErrorActionPreference = "Stop"
+          $base = "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Tools\MSVC"
+          $v = (Get-ChildItem $base -Directory | Where-Object { $_.Name -like "14.29*" } | Select-Object -First 1).Name
+          if (-not $v) { throw "MSVC 14.29 toolset not found" }
+          $bin = Join-Path $base "$v\bin\HostX64\x64"
+          $sdk = "C:\Program Files (x86)\Windows Kits\10"
+          $sdkv = (Get-ChildItem "$sdk\Include" -Directory | Where-Object { $_.Name -like "10.*" } | Sort-Object Name | Select-Object -Last 1).Name
+          Write-Host "Using MSVC=$v SDK=$sdkv"
+          $env:PATH = "$bin;$sdk\bin\$sdkv\x64;$env:CUDA_HOME\bin;$env:PATH"
+          $env:CC = Join-Path $bin "cl.exe"
+          $env:INCLUDE = "$(Join-Path $base $v)\include;$sdk\Include\$sdkv\ucrt;$sdk\Include\$sdkv\um;$sdk\Include\$sdkv\shared;$sdk\Include\$sdkv\winrt;$sdk\Include\$sdkv\cppwinrt"
+          $env:LIB = "$(Join-Path $base $v)\lib\x64;$sdk\Lib\$sdkv\ucrt\x64;$sdk\Lib\$sdkv\um\x64"
+          Write-Host "=== cl banner ==="
+          (& $env:CC 2>&1 | Out-String) | Write-Host
+          Write-Host "=== nvcc ==="
+          (nvcc --version | Out-String) | Write-Host
+          git clone --depth 1 --recursive https://github.com/graphdeco-inria/gaussian-splatting.git
+          pip wheel --no-build-isolation --no-deps -w wheels ./gaussian-splatting/submodules/diff-gaussian-rasterization
+          pip wheel --no-build-isolation --no-deps -w wheels ./gaussian-splatting/submodules/simple-knn
+          pip wheel --no-build-isolation --no-deps -w wheels ./gaussian-splatting/submodules/fused-ssim
+          Get-ChildItem wheels
+
+      - name: Release wheels
+        if: success()
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v1
+          name: gs-wheels v1 (cp310 torch2.1.2 cu118 sm50)
+          files: wheels/*.whl
